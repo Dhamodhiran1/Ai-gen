@@ -15,6 +15,7 @@ import {
 import confetti from 'canvas-confetti';
 import { QuizResponseData, SupportedLanguage, EduModuleId } from '../../types.ts';
 import { exportQuizPDF } from '../../utils/pdfExport.ts';
+import { safePost } from '../../utils/apiClient.ts';
 
 interface QuizViewProps {
   initialTopic?: string;
@@ -76,24 +77,14 @@ export const QuizView: React.FC<QuizViewProps> = ({
       onStartRequest(3, '/quiz', traceQuery);
       setTimeout(() => onStartRequest(4, '/quiz', traceQuery), 300);
 
-      const res = await fetch('/quiz', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic: targetTopic || undefined,
-          text: targetText || undefined,
-          difficulty,
-          count: questionCount,
-          language,
-        }),
+      const json = await safePost<{ success: boolean; data: QuizResponseData }>('/quiz', {
+        topic: targetTopic || undefined,
+        text: targetText || undefined,
+        difficulty,
+        count: questionCount,
+        language,
       });
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP error ${res.status}`);
-      }
-
-      const json = await res.json();
       setQuizData(json.data);
       onStartRequest(5, '/quiz', traceQuery);
       setTimeout(() => onCompleteRequest(), 400);

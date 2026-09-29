@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { LearningPathResponseData, SupportedLanguage, EduModuleId } from '../../types.ts';
 import { exportLearningPathPDF } from '../../utils/pdfExport.ts';
+import { safePost } from '../../utils/apiClient.ts';
 
 interface LearningPathViewProps {
   initialTopic?: string;
@@ -71,24 +72,14 @@ export const LearningPathView: React.FC<LearningPathViewProps> = ({
       onStartRequest(3, '/learn/recommendations', targetTopic);
       setTimeout(() => onStartRequest(4, '/learn/recommendations', targetTopic), 300);
 
-      const res = await fetch('/learn/recommendations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic: targetTopic,
-          currentLevel,
-          pace,
-          goal: goal.trim() || undefined,
-          language,
-        }),
+      const json = await safePost<{ success: boolean; data: LearningPathResponseData }>('/learn/recommendations', {
+        topic: targetTopic,
+        currentLevel,
+        pace,
+        goal: goal.trim() || undefined,
+        language,
       });
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP error ${res.status}`);
-      }
-
-      const json = await res.json();
       setData(json.data);
       onStartRequest(5, '/learn/recommendations', targetTopic);
       setTimeout(() => onCompleteRequest(), 400);

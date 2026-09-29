@@ -24,8 +24,34 @@ const ai = new GoogleGenAI({
   },
 });
 
-// Candidate models in priority order for resilience against high-demand 503s
-const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+// Distinct candidate models for quota resilience (gemini-flash-latest points to gemini-3.8-flash, so we use distinct models)
+const CANDIDATE_MODELS = ['gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+
+// In-memory response cache with TTL to eliminate redundant quota consumption
+interface CacheEntry {
+  data: any;
+  expiresAt: number;
+}
+const apiCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour TTL
+
+function getFromCache(key: string): any | null {
+  const entry = apiCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    apiCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function saveToCache(key: string, data: any) {
+  if (apiCache.size > 300) {
+    const firstKey = apiCache.keys().next().value;
+    if (firstKey) apiCache.delete(firstKey);
+  }
+  apiCache.set(key, { data, expiresAt: Date.now() + CACHE_TTL_MS });
+}
 
 async function generateWithFallback(params: {
   contents: any;
@@ -33,7 +59,8 @@ async function generateWithFallback(params: {
 }) {
   let lastError: any = null;
 
-  for (const model of CANDIDATE_MODELS) {
+  for (let i = 0; i < CANDIDATE_MODELS.length; i++) {
+    const model = CANDIDATE_MODELS[i];
     try {
       const response = await ai.models.generateContent({
         model,
@@ -46,9 +73,42 @@ async function generateWithFallback(params: {
       }
     } catch (err: any) {
       lastError = err;
-      console.warn(`Model ${model} failed with: ${err?.message || err}. Trying next fallback...`);
-      // Short delay before next candidate
-      await new Promise(r => setTimeout(r, 400));
+      const errMsg = err?.message || String(err);
+      const is429 = errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED') || err?.status === 429;
+
+      if (is429) {
+        console.log(`[RateLimitNotice] Model ${model} quota reached. Activating alternative...`);
+        // Extract sub-second retry suggestion if available
+        const matchMs = errMsg.match(/retry in ([\d\.]+)ms/i);
+        const matchSec = errMsg.match(/retry in ([\d\.]+)s/i);
+        let retryWait = 0;
+        if (matchMs && matchMs[1]) {
+          retryWait = Math.min(Math.ceil(parseFloat(matchMs[1])) + 200, 1500);
+        } else if (matchSec && matchSec[1]) {
+          const s = parseFloat(matchSec[1]);
+          if (s <= 1.5) retryWait = Math.ceil(s * 1000) + 200;
+        }
+
+        // Quick retry if sub-second window is advised
+        if (retryWait > 0 && retryWait <= 1500 && i === 0) {
+          await new Promise(r => setTimeout(r, retryWait));
+          try {
+            const retryResp = await ai.models.generateContent({
+              model,
+              contents: params.contents,
+              config: params.config,
+            });
+            if (retryResp && retryResp.text) return retryResp;
+          } catch {
+            // Move immediately to next distinct candidate model
+          }
+        }
+      } else {
+        console.log(`[ModelNotice] Model ${model} transient response. Checking fallback candidate...`);
+      }
+
+      // Small jitter before switching to gemini-3.1-flash-lite
+      await new Promise(r => setTimeout(r, 250));
     }
   }
 
@@ -138,6 +198,12 @@ async function handleExplain(req: Request, res: Response) {
     return res.status(400).json({ error: 'Topic is required' });
   }
 
+  const cacheKey = `explain:${topic.trim().toLowerCase()}:${level}:${language}`;
+  const cached = getFromCache(cacheKey);
+  if (cached) {
+    return res.json({ success: true, data: cached, module: '/explain', cached: true });
+  }
+
   const langPrompt = getLanguageInstruction(language);
   const systemInstruction = `You are EduGenie's Explanation Module. Your goal is to break down complex or difficult concepts so that anyone can understand effortlessly.
 Level: ${level} (e.g., beginner/ELIF5: ultra simple analogies, intermediate: clear balanced conceptual depth, advanced: deep technical insights).
@@ -180,9 +246,10 @@ Return a strict JSON object with these exact keys:
     });
 
     const parsed = JSON.parse(response.text || '{}');
+    saveToCache(cacheKey, parsed);
     return res.json({ success: true, data: parsed, module: '/explain' });
   } catch (error: any) {
-    console.error('Error in /explain (serving fallback content):', error);
+    console.log('[Notice] Serving educational resilience response for /explain');
 
     // High quality intelligent educational fallback in case of transient model 503
     const isTanglish = language === 'tanglish';
@@ -236,6 +303,12 @@ async function handleQA(req: Request, res: Response) {
     return res.status(400).json({ error: 'Question is required' });
   }
 
+  const cacheKey = `qa:${question.trim().toLowerCase()}:${language}`;
+  const cached = getFromCache(cacheKey);
+  if (cached) {
+    return res.json({ success: true, data: cached, module: '/qa', cached: true });
+  }
+
   const langPrompt = getLanguageInstruction(language);
   const systemInstruction = `You are EduGenie's Q&A Module. Your purpose is to give direct, accurate, comprehensive, and helpful answers to any educational or technical query.
 Language: ${langPrompt}.
@@ -273,9 +346,10 @@ Return a strict JSON object with:
     });
 
     const parsed = JSON.parse(response.text || '{}');
+    saveToCache(cacheKey, parsed);
     return res.json({ success: true, data: parsed, module: '/qa' });
   } catch (error: any) {
-    console.error('Error in /qa (serving fallback):', error);
+    console.log('[Notice] Serving educational resilience response for /qa');
 
     const isTanglish = language === 'tanglish';
     const fallbackData = {
@@ -319,8 +393,13 @@ async function handleQuiz(req: Request, res: Response) {
   }
 
   const questionCount = Math.min(Math.max(Number(count) || 5, 3), 10);
-  const langPrompt = getLanguageInstruction(language);
+  const cacheKey = `quiz:${(topic || text || '').trim().slice(0, 100).toLowerCase()}:${difficulty}:${questionCount}:${language}`;
+  const cached = getFromCache(cacheKey);
+  if (cached) {
+    return res.json({ success: true, data: cached, module: '/quiz', cached: true });
+  }
 
+  const langPrompt = getLanguageInstruction(language);
   const systemInstruction = `You are EduGenie's Quiz Generation Module. Generate high quality, intellectually stimulating multiple-choice questions on the topic or provided text passage.
 Difficulty: ${difficulty}.
 Number of questions: ${questionCount}.
@@ -376,9 +455,10 @@ Return a strict JSON object with:
     });
 
     const parsed = JSON.parse(response.text || '{}');
+    saveToCache(cacheKey, parsed);
     return res.json({ success: true, data: parsed, module: '/quiz' });
   } catch (error: any) {
-    console.error('Error in /quiz (serving fallback):', error);
+    console.log('[Notice] Serving educational resilience response for /quiz');
 
     const fallbackQuiz = {
       topic,
@@ -443,6 +523,12 @@ async function handleSummarize(req: Request, res: Response) {
     return res.status(400).json({ error: 'Text content is required for summarization' });
   }
 
+  const cacheKey = `summarize:${text.trim().slice(0, 120).toLowerCase()}:${style}:${language}`;
+  const cached = getFromCache(cacheKey);
+  if (cached) {
+    return res.json({ success: true, data: cached, module: '/summarize', cached: true });
+  }
+
   const langPrompt = getLanguageInstruction(language);
   const systemInstruction = `You are EduGenie's Summarization Module. Transform long paragraphs, lessons, articles, or notes into crystal-clear, structured summaries.
 Style: ${style} (e.g., bullet_points: clear hierarchical points, tldr: quick bite-sized summary, executive: formal strategic takeaways, study_notes: structured student revision notes).
@@ -489,9 +575,10 @@ Return a strict JSON object with:
     });
 
     const parsed = JSON.parse(response.text || '{}');
+    saveToCache(cacheKey, parsed);
     return res.json({ success: true, data: parsed, module: '/summarize' });
   } catch (error: any) {
-    console.error('Error in /summarize (serving fallback):', error);
+    console.log('[Notice] Serving educational resilience response for /summarize');
 
     const fallbackSummary = {
       title: 'Structured Content Summary',
@@ -528,6 +615,12 @@ async function handleLearningPath(req: Request, res: Response) {
   const { topic, currentLevel = 'beginner', goal = '', pace = 'standard', language = 'english' } = req.body;
   if (!topic || typeof topic !== 'string' || !topic.trim()) {
     return res.status(400).json({ error: 'Topic is required' });
+  }
+
+  const cacheKey = `learn:${topic.trim().toLowerCase()}:${currentLevel}:${pace}:${language}`;
+  const cached = getFromCache(cacheKey);
+  if (cached) {
+    return res.json({ success: true, data: cached, module: '/learn/recommendations', cached: true });
   }
 
   const langPrompt = getLanguageInstruction(language);
@@ -590,9 +683,10 @@ Return a strict JSON object with:
     });
 
     const parsed = JSON.parse(response.text || '{}');
+    saveToCache(cacheKey, parsed);
     return res.json({ success: true, data: parsed, module: '/learn/recommendations' });
   } catch (error: any) {
-    console.error('Error in /learn/recommendations (serving fallback):', error);
+    console.log('[Notice] Serving educational resilience response for /learn/recommendations');
 
     const fallbackRoadmap = {
       topic,

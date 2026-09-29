@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { ExplainResponseData, SupportedLanguage, EduModuleId } from '../../types.ts';
 import { exportExplanationPDF } from '../../utils/pdfExport.ts';
+import { safePost } from '../../utils/apiClient.ts';
 
 interface ExplainViewProps {
   language: SupportedLanguage;
@@ -58,22 +59,12 @@ export const ExplainView: React.FC<ExplainViewProps> = ({
       onStartRequest(3, '/explain', targetTopic);
       setTimeout(() => onStartRequest(4, '/explain', targetTopic), 300);
 
-      const res = await fetch('/explain', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic: targetTopic,
-          level,
-          language,
-        }),
+      const json = await safePost<{ success: boolean; data: ExplainResponseData }>('/explain', {
+        topic: targetTopic,
+        level,
+        language,
       });
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP error ${res.status}`);
-      }
-
-      const json = await res.json();
       setData(json.data);
       onStartRequest(5, '/explain', targetTopic);
       setTimeout(() => onCompleteRequest(), 400);

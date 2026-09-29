@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { SummarizeResponseData, SupportedLanguage, EduModuleId } from '../../types.ts';
 import { exportSummarizePDF } from '../../utils/pdfExport.ts';
+import { safePost } from '../../utils/apiClient.ts';
 
 interface SummarizeViewProps {
   language: SupportedLanguage;
@@ -76,22 +77,12 @@ However, aggressive interest rate hikes carry the risk of over-tightening, leadi
       onStartRequest(3, '/summarize', targetText.slice(0, 50) + '...');
       setTimeout(() => onStartRequest(4, '/summarize', targetText.slice(0, 50) + '...'), 300);
 
-      const res = await fetch('/summarize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: targetText,
-          style,
-          language,
-        }),
+      const json = await safePost<{ success: boolean; data: SummarizeResponseData }>('/summarize', {
+        text: targetText,
+        style,
+        language,
       });
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP error ${res.status}`);
-      }
-
-      const json = await res.json();
       setData(json.data);
       onStartRequest(5, '/summarize', targetText.slice(0, 50) + '...');
       setTimeout(() => onCompleteRequest(), 400);

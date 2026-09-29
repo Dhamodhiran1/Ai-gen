@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { QAResponseData, SupportedLanguage, EduModuleId } from '../../types.ts';
 import { exportQAPDF } from '../../utils/pdfExport.ts';
+import { safePost } from '../../utils/apiClient.ts';
 
 interface QAViewProps {
   initialQuestion?: string;
@@ -68,22 +69,12 @@ export const QAView: React.FC<QAViewProps> = ({
       onStartRequest(3, '/qa', targetQ);
       setTimeout(() => onStartRequest(4, '/qa', targetQ), 300);
 
-      const res = await fetch('/qa', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question: targetQ,
-          context: context.trim() || undefined,
-          language,
-        }),
+      const json = await safePost<{ success: boolean; data: QAResponseData }>('/qa', {
+        question: targetQ,
+        context: context.trim() || undefined,
+        language,
       });
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || `HTTP error ${res.status}`);
-      }
-
-      const json = await res.json();
       setData(json.data);
       onStartRequest(5, '/qa', targetQ);
       setTimeout(() => onCompleteRequest(), 400);
